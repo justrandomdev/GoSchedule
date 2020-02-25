@@ -2,10 +2,9 @@ package main
 
 import (
 	"context"
-	"io"
 	"flag"
+	"io"
 	"jobrunner/pkg/config"
-	"jobrunner/pkg/db"
 	"jobrunner/pkg/jobs"
 	"net/http"
 	"os"
@@ -13,17 +12,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gorilla/mux"
 	stdLog "log"
+
+	"github.com/gorilla/mux"
 	log "github.com/sirupsen/logrus"
+
+	//DB support
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/lib/pq"
 )
 
 var (
 	cfg                      config.EnvConfig
-	jobConfig                config.JobsConfig
 	jobRunner                *jobs.JobsRunner
 	listenAddr, fileLocation string
-	coreDb, warehouseDb      db.PostgresConnection
 	logger                   *log.Logger
 )
 
@@ -34,7 +36,7 @@ func main() {
 
 	cancel, err := initApp()
 	if err != nil {
-		log.Fatalf("Error during application initialization: %v\n", err)
+		log.Fatalf("Error during application initialization: %v", err)
 	}
 
 	logWriter := logger.Writer()
@@ -67,7 +69,7 @@ func parseCmdFlags() {
 
 func getEnvConfig() {
 	if err := cfg.LoadConfig("jobsched"); err != nil {
-		log.Fatalf("Error reading environment variables. Reason - %v\n", err)
+		log.Fatalf("Error reading environment variables. Reason - %v", err)
 		os.Exit(1)
 	}
 }
@@ -78,7 +80,7 @@ func initLogger() {
 
 	level, err := log.ParseLevel(cfg.LogLevel)
 	if err != nil {
-		log.Fatalf("JOBSCHED_LOGLEVEL is set to an unknown value. Reason - %v\n", err)
+		log.Fatalf("JOBSCHED_LOGLEVEL is set to an unknown value. Reason - %v", err)
 		os.Exit(1)
 	}
 
@@ -90,19 +92,19 @@ func initApp() (context.CancelFunc, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runnerCtx, _ := context.WithCancel(ctx)
 
-	jobsConfig, err := jobConfig.LoadConfig(cfg.WorkPath, cfg.ScheduleFilename)
+	jobsConfig, err := config.LoadConfig(cfg.WorkPath, cfg.ScheduleFilename)
 	if err != nil {
 		return cancel, err
 	}
 
-	jobRunner, err = jobs.NewRunner(cfg.WorkPath + cfg.JobRunLogFilename, runnerCtx)
+	jobRunner, err = jobs.NewRunner(cfg.WorkPath+cfg.JobRunLogFilename, runnerCtx)
 	if err != nil {
 		return cancel, err
 	}
 
-	jobRunner.LoadJobs(jobsConfig.Jobs)
+	jobRunner.LoadJobs(jobsConfig)
 
-	return cancel, connectDb()
+	return cancel, nil
 }
 
 func initHttpApi(logWriter *io.PipeWriter) *http.Server {
@@ -116,22 +118,6 @@ func initHttpApi(logWriter *io.PipeWriter) *http.Server {
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  15 * time.Second,
 	}
-}
-
-func connectDb() error {
-	if err := coreDb.Connect(cfg.CoreDbHost, cfg.CoreDbName, cfg.CoreDbUser, cfg.CoreDbPassword, cfg.CoreDbPort); err != nil {
-		return err
-	}
-
-	return warehouseDb.Connect(cfg.DwDbHost, cfg.DwDbName, cfg.DwDbUser, cfg.DwDbPassword, cfg.DwDbPort)
-}
-
-func disconnectDb() error {
-	if err := coreDb.Close(); err != nil {
-		return err
-	}
-
-	return warehouseDb.Close()
 }
 
 func setupShutdownChannels() (chan bool, chan os.Signal) {
@@ -153,14 +139,8 @@ func gracefulShutdown(cancel context.CancelFunc, exitChannel chan os.Signal, don
 
 	server.SetKeepAlivesEnabled(false)
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Could not gracefully shutdown the service: %v\n", err)
-	}
-
-	if err := disconnectDb(); err != nil {
-		log.Fatalf("Could not gracefully close the Db connection's: %v\n", err)
+		log.Fatalf("Could not gracefully shutdown the service: %v", err)
 	}
 
 	close(doneChannel)
 }
-
-

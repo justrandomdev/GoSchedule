@@ -4,6 +4,7 @@ import (
 	"context"
 	"io/ioutil"
 	"jobrunner/pkg/config"
+	"jobrunner/pkg/db"
 	"os"
 	"path/filepath"
 	"sync"
@@ -31,8 +32,10 @@ type JobRunLogMap struct {
 
 type JobsRunner struct {
 	JobRunLogMap
-	jobs              map[string]config.JobSpec
-	runChan           chan config.JobSpec
+	sqlJobs           map[string]config.SqlJobSpec
+	importJobs        map[string]config.ImportJobSpec
+	connections       map[string]db.DbConnection
+	runChan           chan interface{}
 	batchCompleteChan chan bool
 	isRunning         bool
 	logPath           string
@@ -56,14 +59,31 @@ func NewRunner(runLogPath string, context context.Context) (*JobsRunner, error) 
 	}, nil
 }
 
-func (j *JobsRunner) LoadJobs(items []config.JobSpec) error {
-	j.jobs = make(map[string]config.JobSpec, len(items))
+func (j *JobsRunner) LoadJobs(items *config.JobsConfig) error {
+	//Convert config to maps used internally
+	j.sqlJobs = make(map[string]config.SqlJobSpec, len(items.SqlJobs))
+	j.importJobs = make(map[string]config.ImportJobSpec, len(items.ImportJobs))
+	j.connections = make(map[string]db.DbConnection, len(items.Connections))
 	j.RunLog = make(map[string]JobRunLogItem)
 
-	for _, item := range items {
-		if _, ok := j.jobs[item.Name]; !ok {
-			j.jobs[item.Name] = item
+	for _, item := range items.SqlJobs {
+		if _, ok := j.sqlJobs[item.Name]; !ok {
+			j.sqlJobs[item.Name] = item
 		}
+	}
+
+	for _, item := range items.ImportJobs {
+		if _, ok := j.importJobs[item.Name]; !ok {
+			j.importJobs[item.Name] = item
+		}
+	}
+
+	for k, v := range items.Connections {
+		dbConn := db.DbConnection{}
+		if err := dbConn.Connect(v.Type, v.Host, v.DbName, v.User, v.Password, v.Port); err != nil {
+			return err
+		}
+		j.connections[k] = dbConn
 	}
 
 	//Update runtimes from log
@@ -73,26 +93,53 @@ func (j *JobsRunner) LoadJobs(items []config.JobSpec) error {
 	}
 
 	for k, v := range existingRunLog {
-		if _, hit := j.jobs[k]; hit {
-
-			js := config.JobSpec{
-				Name:    j.jobs[k].Name,
-				When:    j.jobs[k].When,
-				Query:   j.jobs[k].Query,
-				LastRun: v.LastRun,
-				NextRun: v.NextRun,
+		if _, hit := j.sqlJobs[k]; hit {
+			js := config.SqlJobSpec{
+				Name:       j.sqlJobs[k].Name,
+				When:       j.sqlJobs[k].When,
+				Query:      j.sqlJobs[k].Query,
+				Connection: j.sqlJobs[k].Connection,
+				RunTimes: config.RunTimes{
+					LastRun: v.LastRun,
+					NextRun: v.NextRun,
+				},
 			}
+			j.sqlJobs[k] = js
+		}
 
-			j.jobs[k] = js
+		if _, hit := j.importJobs[k]; hit {
+			js := config.ImportJobSpec{
+				Name:        j.importJobs[k].Name,
+				When:        j.importJobs[k].When,
+				Connection:  j.importJobs[k].Connection,
+				ImportQuery: j.importJobs[k].ImportQuery,
+				ColumnMap:   j.importJobs[k].ColumnMap,
+				ExportQuery: j.importJobs[k].ExportQuery,
+				RunTimes: config.RunTimes{
+					LastRun: v.LastRun,
+					NextRun: v.NextRun,
+				},
+			}
+			j.importJobs[k] = js
 		}
 	}
 
 	return nil
+}
 
+func (j *JobsRunner) disconnectDb() error {
+	for _, v := range j.connections {
+		if err := v.Close(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (j *JobsRunner) Start() error {
-	j.runChan = make(chan config.JobSpec)
+	//j.runChan = make(chan config.SqlJobSpec)
+	j.runChan = make(chan interface{})
 	j.batchCompleteChan = make(chan bool)
 
 	go j.executeJobs()
@@ -111,8 +158,8 @@ func (j *JobsRunner) Start() error {
 	//Keepalive loop. Will wake up every minute to check if a job needs to be run.
 	//This will only stop on context cancellation
 	for {
-		for _, job := range j.jobs {
-			j.processJobs(job)
+		for _, job := range j.sqlJobs {
+			j.processSqlJobs(job)
 			log.Debugf("Job: %+v", job)
 		}
 		j.batchCompleteChan <- true
@@ -133,13 +180,16 @@ func (j *JobsRunner) Stop() {
 	log.Tracef("Jobrunner.Stop waiting...")
 	j.wg.Wait()
 	log.Tracef("Jobrunner.Stop waiting done")
+
+	j.disconnectDb()
+
 	close(j.runChan)
 	close(j.batchCompleteChan)
 	log.Tracef("Jobrunner.Stop channels closed")
 
 }
 
-func (j *JobsRunner) processJobs(job config.JobSpec) {
+func (j *JobsRunner) processSqlJobs(job config.SqlJobSpec) {
 
 	log.Debugf("Executing processJobs")
 	if !j.isRunning {
@@ -171,27 +221,83 @@ func (j *JobsRunner) processJobs(job config.JobSpec) {
 }
 
 func (j *JobsRunner) executeJobs() {
-	for job := range j.runChan {
-		log.Debugf("executeJobs got job from channel: " + job.Name)
-		t := time.Now().UTC()
+	for genJob := range j.runChan {
 
-		//Update run times
-		job.LastRun = t
-		job.NextRun = j.getNextRun(job)
-		j.logJobExecution(job, "success")
+		if val, ok := genJob.(config.SqlJobSpec); ok {
+			err := j.handleSqlJob(&val)
+			if err != nil {
+				j.logJobExecution(val.Name, &val.RunTimes, "failure")
+				log.Errorf("Error executing SQL job %s. %v", val.Name, err)
+			}
+			j.logJobExecution(val.Name, &val.RunTimes, "success")
+		}
 
-		log.Debugf("Starting long running job")
-		time.Sleep(30 * time.Second)
+		if val, ok := genJob.(config.ImportJobSpec); ok {
+			j.handleImportJob(val)
+			j.logJobExecution(val.Name, &val.RunTimes, "success")
+		}
+
+		//log.Debugf("Starting long running job")
+		//time.Sleep(30 * time.Second)
 		j.wg.Done()
 	}
 }
 
-func (j *JobsRunner) logJobExecution(job config.JobSpec, result string) {
-	j.RunLog[job.Name] = JobRunLogItem{
-		//Name:    job.Name,
+func (j *JobsRunner) handleSqlJob(job *config.SqlJobSpec) error {
+	log.Debugf("executeJobs got job from channel: " + job.Name)
+	t := time.Now().UTC()
+
+	//Update run times
+	job.LastRun = t
+	job.NextRun = j.getNextSqlRun(*job)
+
+	//Execute sql query
+	db := j.connections[job.Connection]
+	result, err := db.Conn.Exec(job.Query)
+	if err != nil {
+		return err
+	}
+
+	rowCount, err := result.RowsAffected()
+	if err != nil {
+		log.Debugf("%v", err)
+	}
+
+	log.Debugf("%s query executed. %d rows affected.", job.Name, rowCount)
+	return nil
+}
+
+func (j *JobsRunner) handleImportJob(job config.ImportJobSpec) error {
+	log.Debugf("executeJobs got job from channel: " + job.Name)
+	t := time.Now().UTC()
+
+	//Update run times
+	job.LastRun = t
+	job.NextRun = j.getNextImportRun(job)
+
+	//Execute sql query
+	/*
+	db := j.connections[job.Connection]
+	result, err := db.Conn.Exec(job.Query)
+	if err != nil {
+		log.Debugf("Error executing sql query for job %s. %v", job.Name, err)
+	}
+
+	rowCount, err := result.RowsAffected()
+	if err != nil {
+		log.Debugf("%v", err)
+	}
+
+	log.Debugf("%s query executed. %d rows affected.", job.Name, rowCount)
+	*/
+	return nil
+}
+
+func (j *JobsRunner) logJobExecution(name string, times *config.RunTimes, result string) {
+	j.RunLog[name] = JobRunLogItem{
 		Result:  result,
-		LastRun: job.LastRun,
-		NextRun: job.NextRun,
+		LastRun: times.LastRun,
+		NextRun: times.NextRun,
 	}
 }
 
@@ -251,7 +357,7 @@ func (j *JobsRunner) loadRunLog() (map[string]JobRunLogItem, error) {
 	return existingRunLog, err
 }
 
-func (j *JobsRunner) getNextRun(job config.JobSpec) time.Time {
+func (j *JobsRunner) getNextSqlRun(job config.SqlJobSpec) time.Time {
 	log.Debugf("Executing getNextRun on job %s", job.Name)
 	var lastTime, nextTime time.Time
 
@@ -278,6 +384,35 @@ func (j *JobsRunner) getNextRun(job config.JobSpec) time.Time {
 
 	return nextTime
 }
+
+func (j *JobsRunner) getNextImportRun(job config.ImportJobSpec) time.Time {
+	log.Debugf("Executing getNextRun on job %s", job.Name)
+	var lastTime, nextTime time.Time
+
+	if job.When.Time != "" {
+		y, m, d := time.Now().Date()
+		lastTime, _ = time.Parse(timeFormat, job.When.Time)
+		lastTime = time.Date(y, m, d, lastTime.Hour(), lastTime.Minute(), lastTime.Second(), 0, j.location)
+	} else {
+		lastTime = job.LastRun
+	}
+
+	switch {
+	case job.When.Frequency.Year > 0:
+		nextTime = lastTime.AddDate(int(job.When.Frequency.Year), 0, 0)
+	case job.When.Frequency.Month > 0:
+		nextTime = lastTime.AddDate(0, int(job.When.Frequency.Month), 0)
+	case job.When.Frequency.Day > 0:
+		nextTime = lastTime.AddDate(0, 0, int(job.When.Frequency.Day))
+	case job.When.Frequency.Hour > 0:
+		nextTime = lastTime.Add(time.Duration(job.When.Frequency.Hour) * time.Hour)
+	case job.When.Frequency.Minute > 0:
+		nextTime = lastTime.Add(time.Duration(job.When.Frequency.Minute) * time.Minute)
+	}
+
+	return nextTime
+}
+
 
 func (j *JobsRunner) isDateEqual(a time.Time, b time.Time) bool {
 	return a.Hour() == b.Hour() && a.Minute() == b.Minute()

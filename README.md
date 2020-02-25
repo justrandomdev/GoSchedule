@@ -1,3 +1,7 @@
+# GoSchedule
+
+GoSchedule is a golang job scheduler. It currently support Postgres, Redshift, MySql, MS-SQL Server 
+
 
 ### Example schedule.yaml file:
 
