@@ -34,7 +34,10 @@ func main() {
 	getEnvConfig()
 	initLogger()
 
-	cancel, err := initApp()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := initApp(ctx)
 	if err != nil {
 		log.Fatalf("Error during application initialization: %v", err)
 	}
@@ -46,7 +49,7 @@ func main() {
 
 	done, exit := setupShutdownChannels()
 	go gracefulShutdown(cancel, exit, done, server)
-	go jobRunner.Start()
+	go jobRunner.Start(ctx)
 
 	//log.Printf("Service listening on %s\n", listenAddr)
 	//if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -88,23 +91,23 @@ func initLogger() {
 	log.Printf("Log level set to %s\n", level.String())
 }
 
-func initApp() (context.CancelFunc, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	runnerCtx, _ := context.WithCancel(ctx)
-
+func initApp(ctx context.Context) error {
 	jobsConfig, err := config.LoadConfig(cfg.WorkPath, cfg.ScheduleFilename)
 	if err != nil {
-		return cancel, err
+		return err
 	}
 
-	jobRunner, err = jobs.NewRunner(cfg.WorkPath+cfg.JobRunLogFilename, runnerCtx)
+	jobRunner, err = jobs.NewRunner(cfg.WorkPath+cfg.JobRunLogFilename)
 	if err != nil {
-		return cancel, err
+		return err
 	}
 
-	jobRunner.LoadJobs(jobsConfig)
+	err = jobRunner.LoadJobs(jobsConfig)
+	if err != nil {
+		return err
+	}
 
-	return cancel, nil
+	return nil
 }
 
 func initHttpApi(logWriter *io.PipeWriter) *http.Server {

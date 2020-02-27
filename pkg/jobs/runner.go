@@ -40,22 +40,25 @@ type JobsRunner struct {
 	isRunning         bool
 	logPath           string
 	location          *time.Location
-	ctx               context.Context
+	//ctx               context.Context
+	//ctxCancel         context.CancelFunc
 	wg                sync.WaitGroup
 }
 
-func NewRunner(runLogPath string, context context.Context) (*JobsRunner, error) {
+func NewRunner(runLogPath string) (*JobsRunner, error) {
 	loc, err := time.LoadLocation("UTC")
-
 	if err != nil {
 		return nil, err
 	}
+
+	//thisCtx, cancel := context.WithCancel(parentCtx)	
 
 	return &JobsRunner{
 		isRunning: false,
 		logPath:   filepath.ToSlash(runLogPath),
 		location:  loc,
-		ctx:       context,
+		//ctx:       thisCtx,
+		//ctxCancel: cancel,
 	}, nil
 }
 
@@ -137,9 +140,11 @@ func (j *JobsRunner) disconnectDb() error {
 	return nil
 }
 
-func (j *JobsRunner) Start() error {
-	//j.runChan = make(chan config.SqlJobSpec)
-	j.runChan = make(chan interface{})
+func (j *JobsRunner) Start(parentCtx context.Context) error {
+	thisCtx, cancel := context.WithCancel(parentCtx)		
+	defer cancel()
+
+	j.runChan = make(chan interface{}, runChannelBufferSize)
 	j.batchCompleteChan = make(chan bool)
 
 	go j.executeJobs()
@@ -159,15 +164,21 @@ func (j *JobsRunner) Start() error {
 	//This will only stop on context cancellation
 	for {
 		for _, job := range j.sqlJobs {
-			j.processSqlJobs(job)
+			j.processJobs(job)
 			log.Debugf("Job: %+v", job)
 		}
+
+		for _, job := range j.importJobs {
+			j.processJobs(job)
+			log.Debugf("Job: %+v", job)
+		}
+
 		j.batchCompleteChan <- true
 
 		//Wait for current execution to complete or timeout on context done
 		select {
-		case <-j.ctx.Done():
-			return j.ctx.Err()
+		case <-thisCtx.Done():
+			return thisCtx.Err()
 		default:
 			time.Sleep(30 * time.Second)
 		}
@@ -186,34 +197,48 @@ func (j *JobsRunner) Stop() {
 	close(j.runChan)
 	close(j.batchCompleteChan)
 	log.Tracef("Jobrunner.Stop channels closed")
-
 }
 
-func (j *JobsRunner) processSqlJobs(job config.SqlJobSpec) {
+func (j *JobsRunner) processJobs(job interface{}) {
 
 	log.Debugf("Executing processJobs")
 	if !j.isRunning {
 		return
 	}
 
-	if job.LastRun.IsZero() && job.When.Time == "" {
+	var lastRun, nextRun time.Time
+	var when *config.Schedule
+
+	if val, ok := job.(config.SqlJobSpec); ok {
+		lastRun = val.LastRun
+		nextRun = val.NextRun
+		when = val.When
+	}
+
+	if val, ok := job.(config.ImportJobSpec); ok {
+		lastRun = val.LastRun
+		nextRun = val.NextRun
+		when = val.When
+	}
+
+	if lastRun.IsZero() && when.Time == "" {
 		//New entry, not time based, run now
 		j.wg.Add(1)
 		j.runChan <- job
-	} else if job.LastRun.IsZero() && job.When.Time != "" {
+	} else if lastRun.IsZero() && when.Time != "" {
 		//New entry, time based, run at the correct time
 		y, m, d := time.Now().Date()
-		timeWithDate, _ := time.Parse(timeFormat, job.When.Time)
+		timeWithDate, _ := time.Parse(timeFormat, when.Time)
 		target := timeWithDate.AddDate(y, int(m), d)
 
 		if j.isDateEqual(target, time.Now()) {
 			j.wg.Add(1)
 			j.runChan <- job
 		}
-	} else if !job.LastRun.IsZero() && !job.NextRun.IsZero() {
+	} else if !lastRun.IsZero() && !nextRun.IsZero() {
 		//Is it time to run?
 		t := time.Now()
-		if j.isDateEqual(job.NextRun, t) || t.After(job.NextRun) {
+		if j.isDateEqual(nextRun, t) || t.After(nextRun) {
 			j.wg.Add(1)
 			j.runChan <- job
 		}
@@ -228,8 +253,9 @@ func (j *JobsRunner) executeJobs() {
 			if err != nil {
 				j.logJobExecution(val.Name, &val.RunTimes, "failure")
 				log.Errorf("Error executing SQL job %s. %v", val.Name, err)
+			} else {
+				j.logJobExecution(val.Name, &val.RunTimes, "success")
 			}
-			j.logJobExecution(val.Name, &val.RunTimes, "success")
 		}
 
 		if val, ok := genJob.(config.ImportJobSpec); ok {
@@ -249,7 +275,7 @@ func (j *JobsRunner) handleSqlJob(job *config.SqlJobSpec) error {
 
 	//Update run times
 	job.LastRun = t
-	job.NextRun = j.getNextSqlRun(*job)
+	job.NextRun = j.getNextRun(job.Name, job.LastRun, job.When)
 
 	//Execute sql query
 	db := j.connections[job.Connection]
@@ -273,25 +299,61 @@ func (j *JobsRunner) handleImportJob(job config.ImportJobSpec) error {
 
 	//Update run times
 	job.LastRun = t
-	job.NextRun = j.getNextImportRun(job)
+	job.NextRun = j.getNextRun(job.Name, job.LastRun, job.When)
+
+	pipeline := NewSqlImportPipeline(j.connections, job)
+
+	//Log import errors
+	go func(){
+		for err := range pipeline.ErrorChan {
+			log.Errorf("Sql import error for job %s: %+v", job.Name, err)
+		}		
+	}()
+
+	err := pipeline.StartImport()
+	if err != nil {
+		return err
+	}
+
+	/*
+		for i, r := range resultSet {
+			fld := reflect.Indirect(reflect.ValueOf(r))
+			fmt.Printf("==============================> Row number: %d\n\n", i)
+			for j := 0; j < fld.NumField(); j++ {
+				name := fld.Type().Field(j).Name
+				val := fld.Field(j).Interface()
+				fmt.Printf("Field name: %s - value: %+v\n\n", name, val)
+			}
+
+		}
+
+		fmt.Println(len(resultSet))
+	*/
+	//Generate struct that needs to store data
+	//Execute ImportQuery
+
+	//Read records
+	//Parse export query(if needed SQLx should handle it)
+	//Execute export query
 
 	//Execute sql query
 	/*
-	db := j.connections[job.Connection]
-	result, err := db.Conn.Exec(job.Query)
-	if err != nil {
-		log.Debugf("Error executing sql query for job %s. %v", job.Name, err)
-	}
+		db := j.connections[job.Connection]
+		result, err := db.Conn.Exec(job.Query)
+		if err != nil {
+			log.Debugf("Error executing sql query for job %s. %v", job.Name, err)
+		}
 
-	rowCount, err := result.RowsAffected()
-	if err != nil {
-		log.Debugf("%v", err)
-	}
+		rowCount, err := result.RowsAffected()
+		if err != nil {
+			log.Debugf("%v", err)
+		}
 
-	log.Debugf("%s query executed. %d rows affected.", job.Name, rowCount)
+		log.Debugf("%s query executed. %d rows affected.", job.Name, rowCount)
 	*/
 	return nil
 }
+
 
 func (j *JobsRunner) logJobExecution(name string, times *config.RunTimes, result string) {
 	j.RunLog[name] = JobRunLogItem{
@@ -357,62 +419,33 @@ func (j *JobsRunner) loadRunLog() (map[string]JobRunLogItem, error) {
 	return existingRunLog, err
 }
 
-func (j *JobsRunner) getNextSqlRun(job config.SqlJobSpec) time.Time {
-	log.Debugf("Executing getNextRun on job %s", job.Name)
+func (j *JobsRunner) getNextRun(name string, lastRun time.Time, when *config.Schedule) time.Time {
+	log.Debugf("Executing getNextRun on job %s", name)
 	var lastTime, nextTime time.Time
 
-	if job.When.Time != "" {
+	if when.Time != "" {
 		y, m, d := time.Now().Date()
-		lastTime, _ = time.Parse(timeFormat, job.When.Time)
+		lastTime, _ = time.Parse(timeFormat, when.Time)
 		lastTime = time.Date(y, m, d, lastTime.Hour(), lastTime.Minute(), lastTime.Second(), 0, j.location)
 	} else {
-		lastTime = job.LastRun
+		lastTime = lastRun
 	}
 
 	switch {
-	case job.When.Frequency.Year > 0:
-		nextTime = lastTime.AddDate(int(job.When.Frequency.Year), 0, 0)
-	case job.When.Frequency.Month > 0:
-		nextTime = lastTime.AddDate(0, int(job.When.Frequency.Month), 0)
-	case job.When.Frequency.Day > 0:
-		nextTime = lastTime.AddDate(0, 0, int(job.When.Frequency.Day))
-	case job.When.Frequency.Hour > 0:
-		nextTime = lastTime.Add(time.Duration(job.When.Frequency.Hour) * time.Hour)
-	case job.When.Frequency.Minute > 0:
-		nextTime = lastTime.Add(time.Duration(job.When.Frequency.Minute) * time.Minute)
+	case when.Frequency.Year > 0:
+		nextTime = lastTime.AddDate(int(when.Frequency.Year), 0, 0)
+	case when.Frequency.Month > 0:
+		nextTime = lastTime.AddDate(0, int(when.Frequency.Month), 0)
+	case when.Frequency.Day > 0:
+		nextTime = lastTime.AddDate(0, 0, int(when.Frequency.Day))
+	case when.Frequency.Hour > 0:
+		nextTime = lastTime.Add(time.Duration(when.Frequency.Hour) * time.Hour)
+	case when.Frequency.Minute > 0:
+		nextTime = lastTime.Add(time.Duration(when.Frequency.Minute) * time.Minute)
 	}
 
 	return nextTime
 }
-
-func (j *JobsRunner) getNextImportRun(job config.ImportJobSpec) time.Time {
-	log.Debugf("Executing getNextRun on job %s", job.Name)
-	var lastTime, nextTime time.Time
-
-	if job.When.Time != "" {
-		y, m, d := time.Now().Date()
-		lastTime, _ = time.Parse(timeFormat, job.When.Time)
-		lastTime = time.Date(y, m, d, lastTime.Hour(), lastTime.Minute(), lastTime.Second(), 0, j.location)
-	} else {
-		lastTime = job.LastRun
-	}
-
-	switch {
-	case job.When.Frequency.Year > 0:
-		nextTime = lastTime.AddDate(int(job.When.Frequency.Year), 0, 0)
-	case job.When.Frequency.Month > 0:
-		nextTime = lastTime.AddDate(0, int(job.When.Frequency.Month), 0)
-	case job.When.Frequency.Day > 0:
-		nextTime = lastTime.AddDate(0, 0, int(job.When.Frequency.Day))
-	case job.When.Frequency.Hour > 0:
-		nextTime = lastTime.Add(time.Duration(job.When.Frequency.Hour) * time.Hour)
-	case job.When.Frequency.Minute > 0:
-		nextTime = lastTime.Add(time.Duration(job.When.Frequency.Minute) * time.Minute)
-	}
-
-	return nextTime
-}
-
 
 func (j *JobsRunner) isDateEqual(a time.Time, b time.Time) bool {
 	return a.Hour() == b.Hour() && a.Minute() == b.Minute()

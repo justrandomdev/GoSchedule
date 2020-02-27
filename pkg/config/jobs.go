@@ -13,10 +13,9 @@ import (
 const timeFormat string = "15:04"
 
 type RunTimes struct {
-	LastRun    time.Time
-	NextRun    time.Time
+	LastRun time.Time
+	NextRun time.Time
 }
-
 
 type JobFrequency struct {
 	Minute byte `yaml:"minute"`
@@ -40,13 +39,18 @@ type SqlJobSpec struct {
 	RunTimes
 }
 
+type DataField struct {
+	Name string `yaml:"name"`
+	Type string `yaml:"type"`
+}
+
 type ImportJobSpec struct {
-	Name        string    `yaml:"name"`
-	Connection  string    `yaml:"connection"`
-	When        *Schedule `yaml:"when"`
-	ImportQuery string    `yaml:"importQuery"`
-	ColumnMap   []string  `yaml:"columnMap"`
-	ExportQuery string    `yaml:"exportQuery"`
+	Name        string      `yaml:"name"`
+	Connection  string      `yaml:"connection"`
+	When        *Schedule   `yaml:"when"`
+	ImportQuery string      `yaml:"importQuery"`
+	ColumnMap   []DataField `yaml:"columnMap"`
+	ExportQuery string      `yaml:"exportQuery"`
 	RunTimes
 }
 
@@ -63,11 +67,6 @@ type JobsConfig struct {
 	SqlJobs     []SqlJobSpec                `yaml:"sqlJobs"`
 	ImportJobs  []ImportJobSpec             `yaml:"sqlImports"`
 	Connections map[string]DbConnectionDefs `yaml:"dbConnections"`
-}
-
-type Validator struct {
-	CompareFunc func(interface{}) bool
-	Errorf      string
 }
 
 func LoadConfig(workPath string, filename string) (*JobsConfig, error) {
@@ -111,7 +110,7 @@ func validateSqlJobs(config []SqlJobSpec, names map[string]bool) error {
 		if job.Name == "" {
 			return fmt.Errorf("Name value in sql job number %d is required", idx+1)
 		}
-		
+
 		if job.Connection == "" {
 			return fmt.Errorf("Query value in sql job %s is required", job.Name)
 		}
@@ -119,7 +118,7 @@ func validateSqlJobs(config []SqlJobSpec, names map[string]bool) error {
 		if job.When == nil {
 			return fmt.Errorf("When value in import job %s is required", job.Name)
 		}
-	
+
 		if ok, err := validateWhen(job.When, job.Name); !ok {
 			return err
 		}
@@ -157,7 +156,7 @@ func validateImportJobs(config []ImportJobSpec, names map[string]bool) error {
 		if job.ExportQuery == "" {
 			return fmt.Errorf("ExportQuery value in import job %s is required", job.Name)
 		}
-	
+
 		if ok, err := validateWhen(job.When, job.Name); !ok {
 			return err
 		}
