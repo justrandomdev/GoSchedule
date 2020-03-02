@@ -36,7 +36,7 @@ type JobsRunner struct {
 	importJobs        map[string]config.ImportJobSpec
 	connections       map[string]db.DbConnection
 	runChan           chan interface{}
-	batchCompleteChan chan bool
+	//batchCompleteChan chan bool
 	isRunning         bool
 	logPath           string
 	location          *time.Location
@@ -102,7 +102,7 @@ func (j *JobsRunner) LoadJobs(items *config.JobsConfig) error {
 				When:       j.sqlJobs[k].When,
 				Query:      j.sqlJobs[k].Query,
 				Connection: j.sqlJobs[k].Connection,
-				RunTimes: config.RunTimes{
+				RunTimes: &config.RunTimes{
 					LastRun: v.LastRun,
 					NextRun: v.NextRun,
 				},
@@ -112,13 +112,14 @@ func (j *JobsRunner) LoadJobs(items *config.JobsConfig) error {
 
 		if _, hit := j.importJobs[k]; hit {
 			js := config.ImportJobSpec{
-				Name:        j.importJobs[k].Name,
-				When:        j.importJobs[k].When,
-				Connection:  j.importJobs[k].Connection,
-				ImportQuery: j.importJobs[k].ImportQuery,
-				ColumnMap:   j.importJobs[k].ColumnMap,
-				ExportQuery: j.importJobs[k].ExportQuery,
-				RunTimes: config.RunTimes{
+				Name:        	   j.importJobs[k].Name,
+				When:        	   j.importJobs[k].When,
+				ImportConnection:  j.importJobs[k].ImportConnection,
+				ExportConnection:  j.importJobs[k].ExportConnection,
+				ImportQuery: 	   j.importJobs[k].ImportQuery,
+				ColumnMap:   	   j.importJobs[k].ColumnMap,
+				ExportQuery: 	   j.importJobs[k].ExportQuery,
+				RunTimes: &config.RunTimes{
 					LastRun: v.LastRun,
 					NextRun: v.NextRun,
 				},
@@ -145,11 +146,12 @@ func (j *JobsRunner) Start(parentCtx context.Context) error {
 	defer cancel()
 
 	j.runChan = make(chan interface{}, runChannelBufferSize)
-	j.batchCompleteChan = make(chan bool)
+	//j.batchCompleteChan = make(chan bool)
 
 	go j.executeJobs()
 
 	//Write to runlog after each 'batch' has been processed
+	/*
 	go func(receiver *JobsRunner) {
 		for range j.batchCompleteChan {
 			if err := receiver.writeJobRunLog(); err != nil {
@@ -157,7 +159,7 @@ func (j *JobsRunner) Start(parentCtx context.Context) error {
 			}
 		}
 	}(j)
-
+	*/
 	j.isRunning = true
 
 	//Keepalive loop. Will wake up every minute to check if a job needs to be run.
@@ -173,7 +175,7 @@ func (j *JobsRunner) Start(parentCtx context.Context) error {
 			log.Debugf("Job: %+v", job)
 		}
 
-		j.batchCompleteChan <- true
+		//j.batchCompleteChan <- true
 
 		//Wait for current execution to complete or timeout on context done
 		select {
@@ -195,7 +197,7 @@ func (j *JobsRunner) Stop() {
 	j.disconnectDb()
 
 	close(j.runChan)
-	close(j.batchCompleteChan)
+	//close(j.batchCompleteChan)
 	log.Tracef("Jobrunner.Stop channels closed")
 }
 
@@ -210,14 +212,18 @@ func (j *JobsRunner) processJobs(job interface{}) {
 	var when *config.Schedule
 
 	if val, ok := job.(config.SqlJobSpec); ok {
-		lastRun = val.LastRun
-		nextRun = val.NextRun
+		if val.RunTimes != nil {
+			lastRun = val.RunTimes.LastRun
+			nextRun = val.RunTimes.NextRun
+		}
 		when = val.When
 	}
 
 	if val, ok := job.(config.ImportJobSpec); ok {
-		lastRun = val.LastRun
-		nextRun = val.NextRun
+		if val.RunTimes != nil {
+			lastRun = val.RunTimes.LastRun
+			nextRun = val.RunTimes.NextRun
+		}
 		when = val.When
 	}
 
@@ -246,26 +252,49 @@ func (j *JobsRunner) processJobs(job interface{}) {
 }
 
 func (j *JobsRunner) executeJobs() {
+
 	for genJob := range j.runChan {
+		var jobName string
+		var runTimes *config.RunTimes
+		logJob := false
 
 		if val, ok := genJob.(config.SqlJobSpec); ok {
+			if val.RunTimes == nil {
+				val.RunTimes = &config.RunTimes{}
+			}
 			err := j.handleSqlJob(&val)
+			
 			if err != nil {
-				j.logJobExecution(val.Name, &val.RunTimes, "failure")
+				j.logJobExecution(val.Name, val.RunTimes, "failure")
 				log.Errorf("Error executing SQL job %s. %v", val.Name, err)
 			} else {
-				j.logJobExecution(val.Name, &val.RunTimes, "success")
+				logJob = true
+				jobName = val.Name
+				runTimes = val.RunTimes
 			}
 		}
 
 		if val, ok := genJob.(config.ImportJobSpec); ok {
-			j.handleImportJob(val)
-			j.logJobExecution(val.Name, &val.RunTimes, "success")
-		}
+			if val.RunTimes == nil {
+				val.RunTimes = &config.RunTimes{}
+			}
+			err := j.handleImportJob(&val)
 
-		//log.Debugf("Starting long running job")
-		//time.Sleep(30 * time.Second)
+			if err != nil {
+				j.logJobExecution(val.Name, val.RunTimes, "failure")
+				log.Errorf("Error executing SQL job %s. %v", val.Name, err)
+			} else {
+				logJob = true
+				jobName = val.Name
+				runTimes = val.RunTimes
+			}
+		}
+		
 		j.wg.Done()
+
+		if logJob {
+			j.logJobExecution(jobName, runTimes, "success")
+		}
 	}
 }
 
@@ -276,6 +305,8 @@ func (j *JobsRunner) handleSqlJob(job *config.SqlJobSpec) error {
 	//Update run times
 	job.LastRun = t
 	job.NextRun = j.getNextRun(job.Name, job.LastRun, job.When)
+
+	j.logJobExecution(job.Name, job.RunTimes,"processing")
 
 	//Execute sql query
 	db := j.connections[job.Connection]
@@ -293,15 +324,17 @@ func (j *JobsRunner) handleSqlJob(job *config.SqlJobSpec) error {
 	return nil
 }
 
-func (j *JobsRunner) handleImportJob(job config.ImportJobSpec) error {
+func (j *JobsRunner) handleImportJob(job *config.ImportJobSpec) error {
 	log.Debugf("executeJobs got job from channel: " + job.Name)
 	t := time.Now().UTC()
 
 	//Update run times
-	job.LastRun = t
-	job.NextRun = j.getNextRun(job.Name, job.LastRun, job.When)
+	job.RunTimes.LastRun = t
+	job.RunTimes.NextRun = j.getNextRun(job.Name, job.LastRun, job.When)
 
-	pipeline := NewSqlImportPipeline(j.connections, job)
+	j.logJobExecution(job.Name, job.RunTimes,"processing")
+
+	pipeline := NewSqlImportPipeline(j.connections, *job, j.connections[job.ImportConnection], j.connections[job.ExportConnection])
 
 	//Log import errors
 	go func(){
@@ -310,10 +343,12 @@ func (j *JobsRunner) handleImportJob(job config.ImportJobSpec) error {
 		}		
 	}()
 
+
 	err := pipeline.StartImport()
 	if err != nil {
 		return err
 	}
+	defer pipeline.Close()
 
 	/*
 		for i, r := range resultSet {
@@ -360,6 +395,10 @@ func (j *JobsRunner) logJobExecution(name string, times *config.RunTimes, result
 		Result:  result,
 		LastRun: times.LastRun,
 		NextRun: times.NextRun,
+	}
+
+	if err := j.writeJobRunLog(); err != nil {
+		log.Errorf("Error writing run log file: %v\n", err)
 	}
 }
 

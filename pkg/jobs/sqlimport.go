@@ -1,54 +1,79 @@
 package jobs
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"jobrunner/pkg/config"
 	"jobrunner/pkg/db"
 	"reflect"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/araddon/dateparse"
 )
 
-func NewSqlImportPipeline(cons map[string]db.DbConnection, jobConfig config.ImportJobSpec) *SqlImportPipeline {
-	dataStruct, nameMap := makeStruct(jobConfig.ColumnMap)
-	return &SqlImportPipeline{
-		connections:    cons,
-		dataStructType: dataStruct,
-		job:            jobConfig,
-		correctNameMap: nameMap,
-		ErrorChan: make(chan error),
-	}
+const (
+	
+)
 
+func NewSqlImportPipeline(cons map[string]db.DbConnection, jobConfig config.ImportJobSpec, importDbConn db.DbConnection, exportDbConn db.DbConnection) *SqlImportPipeline {
+	dataStruct, nameMap := makeStruct(jobConfig.ColumnMap)
+
+	return &SqlImportPipeline {
+		connections:      cons,
+		dataStructType:   dataStruct,
+		job:              jobConfig,
+		correctNameMap:   nameMap,
+		importDb:         importDbConn,
+		exportDb:         exportDbConn,
+		ErrorChan:        make(chan error),
+		importChan:       make(chan interface{}),
+		rollbackDbChan:   make(chan struct{}),
+		cancelDbReadChan: make(chan struct{}),
+	}
 }
 
 type SqlImportPipeline struct {
-	job            config.ImportJobSpec
-	connections    map[string]db.DbConnection
-	dataStructType reflect.Type
-	correctNameMap map[string]string
-	importChan     chan interface{}
-	ErrorChan      chan error
+	job              config.ImportJobSpec
+	connections      map[string]db.DbConnection
+	dataStructType   reflect.Type
+	correctNameMap   map[string]string
+	importDb         db.DbConnection
+	exportDb         db.DbConnection
+	importChan       chan interface{}
+	ErrorChan        chan error
+	rollbackDbChan   chan struct{}
+	cancelDbReadChan chan struct{}
+	dbTx             *sql.Tx
+	wg               sync.WaitGroup
 }
 
 func (s *SqlImportPipeline) StartImport() error {
-	s.importChan = make(chan interface{})
-	defer close(s.importChan)
-	defer close(s.ErrorChan)
+
+	err := s.setupDbTransaction()
+	if err != nil {
+		return err
+	}
 
 	go s.export()
 
 	//Execute sql query
-	db := s.connections[s.job.Connection]
-	rows, err := db.Conn.Query(s.job.ImportQuery)
+	//db := s.connections[s.job.Connection]
+	rows, err := s.importDb.Conn.Query(s.job.ImportQuery)
 	if err != nil {
 		return err
 	}
+
+	//Close rows if there's an error on the import side i.e: abort
+	go func() {
+		for range s.cancelDbReadChan {
+			rows.Close()
+		}
+	}()
 
 	cols, _ := rows.Columns()
 
@@ -75,20 +100,19 @@ func (s *SqlImportPipeline) StartImport() error {
 
 			fld := instance.Elem().FieldByName(strings.Title(colName))
 
-			fmt.Println(fld.Interface())
 			switch fld.Interface().(type) {
 			case string:
 				fld.SetString((*val).(string))
 			case int:
-				intVal, err := strconv.Atoi((*val).(string))
-				if err != nil {
-					s.ErrorChan<-err
+				intVal, ok := (*val).(int64)
+				if !ok {
+					s.ErrorChan<- errors.New("Unable to convert value to int64")
 				}
-				fld.SetInt(int64(intVal))
+				fld.SetInt(intVal)
 			case bool:
-				boolVal, err := strconv.ParseBool((*val).(string))
-				if err != nil {
-					s.ErrorChan<-err
+				boolVal, ok := (*val).(bool)
+				if !ok {
+					s.ErrorChan<- errors.New("Unable to convert value to bool")
 				}
 				fld.SetBool(boolVal)
 			case time.Time:
@@ -96,54 +120,115 @@ func (s *SqlImportPipeline) StartImport() error {
 				if err != nil {
 					s.ErrorChan<-err
 				}
-				fmt.Println(timeVal)
 				fld.Set(reflect.ValueOf(timeVal))
 			}
 		}
-
+		s.wg.Add(1)
 		s.importChan<-instance.Interface()
 	}
+
+	s.wg.Wait()
+
+	err = s.dbTx.Commit() 
+
+	//commit transaction
+	return err
+}
+
+func (s *SqlImportPipeline) Close() {
+	close(s.rollbackDbChan)
+	close(s.cancelDbReadChan)
+	close(s.importChan)
+	close(s.ErrorChan)
+}
+
+func (s *SqlImportPipeline) setupDbTransaction() error {
+	tx, err := s.exportDb.Conn.Begin()
+	if err != nil {
+		return err
+	}
+
+	s.dbTx = tx
+
+	go func() {
+		for range s.rollbackDbChan {
+			err := s.dbTx.Rollback()
+			if err != nil {
+				s.ErrorChan<-err
+			}
+		}
+	}()
 
 	return nil
 }
 
 func (s *SqlImportPipeline) export() {
 	for row := range s.importChan {
-		fld := reflect.Indirect(reflect.ValueOf(row))
 
-		//query, args, err := sqlx.Named(s.job.ExportQuery, fld)		
-		query, err := s.parseNamedQuery(s.job.ExportQuery, fld)
+		query, _, err := s.parseNamedQuery(s.job.ExportQuery, row)
+		fmt.Println(query)
 		if err != nil {
 			s.ErrorChan<-err
+			s.rollbackDbChan<-struct{}{}
+			s.cancelDbReadChan<-struct{}{}
 		}
 
-		fmt.Println(query)
-
-		//b.Query(query, args...)
-		for i := 0; i < fld.NumField(); i++ {
-			name := fld.Type().Field(i).Name
-			val := fld.Field(i).Interface()
-			fmt.Printf("Field name: %s - value: %+v\n\n", name, val)
+		_, err =  s.exportDb.Conn.Exec(query)
+		if err != nil {
+			s.ErrorChan<-err
+			s.rollbackDbChan<-struct{}{}
+			s.cancelDbReadChan<-struct{}{}
 		}
+
+		s.wg.Done()
+
 	}
 }
 
-func (s *SqlImportPipeline) parseNamedQuery(sql string, row interface{}) (string, error) {
+func (s *SqlImportPipeline) parseNamedQuery(sql string, row interface{}) (string, []interface{}, error) {
+	result := sql
 	np := regexp.MustCompile(`:(\w)*\b`)
 	matches := np.FindAllString(sql, -1)
-	for _, v := range matches {
+	args := make([]interface{}, len(matches))
+	
+	for i, v := range matches {
 		fldName, found := s.correctNameMap[strings.ReplaceAll(v, ":", "")]
 		if !found {
-			return "", errors.New("Unknown paramater name in export query: " + v)
+			return "", args, errors.New("Unknown paramater name in export query: " + v)
 		}
 
-		fld := reflect.Indirect(reflect.ValueOf(row))
-		field := fld.FieldByName(fldName)
-		fldValue := field.Interface()
-		fmt.Printf(fldValue.(string))
+		field := reflect.Indirect(reflect.ValueOf(row)).FieldByName(fldName)
+		strVal, err := s.toString(field.Interface())
+		if err != nil {
+			return "", args, err
+		}
+
+		args[i] = field.Interface()
+		result = strings.Replace(result, v, strVal, 1)
 	}
 
-	return "", nil
+	return result, args, nil
+}
+
+func (s *SqlImportPipeline) toString(value interface{}) (string, error) {
+
+	switch value.(type) {
+	case string:
+		return  `'` + value.(string) + `'`, nil
+	case int:
+		return strconv.Itoa(value.(int)), nil
+	case bool:
+		return strconv.FormatBool(value.(bool)), nil
+	case time.Time:
+		t, ok := value.(time.Time)
+		if !ok {
+			return "", errors.New("Error converting Time to string")
+		}
+
+		return `'` + t.Format(time.RFC3339) + `'`, nil
+	}
+
+	return "", errors.New(`Unsupported type. Can't convert to string`)
 }
 
 
@@ -185,10 +270,4 @@ func makeStruct(columnMap []config.DataField) (reflect.Type, map[string]string) 
 func makeStructInstance(t reflect.Type) reflect.Value {
 	instance := reflect.New(t)
 	return reflect.ValueOf(instance.Interface())
-}
-
-func memUsage(m1, m2 *runtime.MemStats) {
-	fmt.Println("Alloc:", m2.Alloc-m1.Alloc,
-		"TotalAlloc:", m2.TotalAlloc-m1.TotalAlloc,
-		"HeapAlloc:", m2.HeapAlloc-m1.HeapAlloc)
 }

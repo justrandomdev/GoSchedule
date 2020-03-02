@@ -31,27 +31,28 @@ type Schedule struct {
 	Frequency *JobFrequency `yaml:"frequency"`
 }
 
-type SqlJobSpec struct {
-	Name       string    `yaml:"name"`
-	Connection string    `yaml:"connection"`
-	When       *Schedule `yaml:"when"`
-	Query      string    `yaml:"query"`
-	RunTimes
-}
-
 type DataField struct {
 	Name string `yaml:"name"`
 	Type string `yaml:"type"`
 }
 
 type ImportJobSpec struct {
-	Name        string      `yaml:"name"`
-	Connection  string      `yaml:"connection"`
-	When        *Schedule   `yaml:"when"`
-	ImportQuery string      `yaml:"importQuery"`
-	ColumnMap   []DataField `yaml:"columnMap"`
-	ExportQuery string      `yaml:"exportQuery"`
-	RunTimes
+	Name              string      `yaml:"name"`
+	ImportConnection  string `yaml:"importConnection"`
+	ExportConnection  string `yaml:"exportConnection"`
+	When        	  *Schedule   `yaml:"when"`
+	ImportQuery 	  string      `yaml:"importQuery"`
+	ColumnMap   	  []DataField `yaml:"columnMap"`
+	ExportQuery 	  string      `yaml:"exportQuery"`
+	*RunTimes
+}
+
+type SqlJobSpec struct {
+	Name       string    `yaml:"name"`
+	Connection string    `yaml:"connection"`
+	When       *Schedule `yaml:"when"`
+	Query      string    `yaml:"query"`
+	*RunTimes
 }
 
 type DbConnectionDefs struct {
@@ -112,7 +113,7 @@ func validateSqlJobs(config []SqlJobSpec, names map[string]bool) error {
 		}
 
 		if job.Connection == "" {
-			return fmt.Errorf("Query value in sql job %s is required", job.Name)
+			return fmt.Errorf("Connection value in sql job %s is required", job.Name)
 		}
 
 		if job.When == nil {
@@ -137,8 +138,13 @@ func validateImportJobs(config []ImportJobSpec, names map[string]bool) error {
 		if job.Name == "" {
 			return fmt.Errorf("Name value in import job number %d is required", idx+1)
 		}
-		if job.Connection == "" {
-			return fmt.Errorf("Query value in import job %s is required", job.Name)
+
+		if job.ImportConnection == "" {
+			return fmt.Errorf("Import connection value in import job %s is required", job.Name)
+		}
+
+		if job.ExportConnection == "" {
+			return fmt.Errorf("Export connection value in import job %s is required", job.Name)
 		}
 
 		if job.When == nil {
